@@ -1,0 +1,814 @@
+"""
+algorithms.py
+=============
+Four optimization algorithms implemented from scratch (no scikit-learn).
+
+1. Genetic Algorithm (GA)
+   - 50 individuals, tournament selection (k=3), uniform crossover, 10% Gaussian mutation
+2. Particle Swarm Optimization (PSO)
+   - 30 particles, w=0.7, c1=1.5, c2=1.5
+3. Neural Network (NN)
+   - Architecture: 20-64-32-1, ReLU hidden, Linear output
+   - Trained via mini-batch gradient descent (backpropagation from scratch)
+4. Decision Tree (Entropy / Information Gain)
+   - Max depth 5, extracts human-readable IF/THEN rules
+
+All algorithms optimise the ecosystem fitness function defined in ecosystem.py.
+
+Author: AI Ecosystem Team
+"""
+
+import numpy as np
+import random
+import math
+import json
+import pickle
+from typing import Dict, List, Optional, Tuple, Callable
+
+from ecosystem import (
+    DEFAULT_PARAMS, PARAM_BOUNDS, PARAM_KEYS, evaluate_params
+)
+
+
+# ===========================================================================
+# Utility helpers
+# ===========================================================================
+
+def params_to_vector(params: Dict[str, float]) -> List[float]:
+    return [params[k] for k in PARAM_KEYS]
+
+def vector_to_params(vec: List[float]) -> Dict[str, float]:
+    return dict(zip(PARAM_KEYS, vec))
+
+def clip_vector(vec: List[float]) -> List[float]:
+    out = []
+    for k, v in zip(PARAM_KEYS, vec):
+        lo, hi = PARAM_BOUNDS[k]
+        out.append(max(lo, min(hi, v)))
+    return out
+
+def random_vector() -> List[float]:
+    vec = []
+    for k in PARAM_KEYS:
+        lo, hi = PARAM_BOUNDS[k]
+        vec.append(random.uniform(lo, hi))
+    return vec
+
+DIM = len(PARAM_KEYS)
+
+
+# ===========================================================================
+# 1. Genetic Algorithm
+# ===========================================================================
+
+class GeneticAlgorithm:
+    """
+    Genetic Algorithm for ecosystem parameter optimisation.
+
+    Configuration
+    -------------
+    pop_size          : 50 individuals
+    tournament_size   : 3
+    crossover_type    : uniform (each gene from parent A or B with p=0.5)
+    mutation_rate     : 0.10  (10% of genes mutated per individual)
+    mutation_strength : 0.05  (Gaussian std as fraction of parameter range)
+    elitism           : top 2 individuals always survive
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 20,
+        pop_size: int = 50,
+        tournament_size: int = 3,
+        mutation_rate: float = 0.10,
+        mutation_strength: float = 0.05,
+        elitism: int = 2,
+        max_steps: int = 120,
+        callback: Optional[Callable] = None,
+    ):
+        self.grid_size       = grid_size
+        self.pop_size        = pop_size
+        self.tournament_size = tournament_size
+        self.mutation_rate   = mutation_rate
+        self.mutation_strength = mutation_strength
+        self.elitism         = elitism
+        self.max_steps       = max_steps
+        self.callback        = callback  # called with (gen, best_fitness) each generation
+
+        # State
+        self.population: List[List[float]] = []
+        self.fitnesses:  List[float]       = []
+        self.best_individual: List[float]  = []
+        self.best_fitness: float           = -np.inf
+        self.history: List[Dict]           = []  # per-generation stats
+
+    # ------------------------------------------------------------------
+
+    def _evaluate_all(self) -> List[float]:
+        """Evaluate fitness for every individual in the population."""
+        fits = []
+        for ind in self.population:
+            result = evaluate_params(ind, grid_size=self.grid_size, max_steps=self.max_steps)
+            fits.append(result["fitness"])
+        return fits
+
+    def _tournament_select(self) -> List[float]:
+        """Select one individual via tournament selection."""
+        candidates = random.sample(range(self.pop_size), self.tournament_size)
+        best_idx = max(candidates, key=lambda i: self.fitnesses[i])
+        return list(self.population[best_idx])
+
+    def _uniform_crossover(self, parent_a: List[float], parent_b: List[float]) -> List[float]:
+        """Uniform crossover: each gene is taken from A or B with equal probability."""
+        child = []
+        for ga, gb in zip(parent_a, parent_b):
+            child.append(ga if random.random() < 0.5 else gb)
+        return child
+
+    def _mutate(self, individual: List[float]) -> List[float]:
+        """
+        Apply Gaussian mutation to each gene with probability mutation_rate.
+        Mutation std = mutation_strength × (param_range).
+        """
+        mutated = []
+        for i, (k, v) in enumerate(zip(PARAM_KEYS, individual)):
+            if random.random() < self.mutation_rate:
+                lo, hi = PARAM_BOUNDS[k]
+                std = self.mutation_strength * (hi - lo)
+                v = v + random.gauss(0, std)
+                v = max(lo, min(hi, v))
+            mutated.append(v)
+        return mutated
+
+    # ------------------------------------------------------------------
+
+    def run(self, n_generations: int = 30) -> Dict:
+        """
+        Execute the genetic algorithm.
+
+        Parameters
+        ----------
+        n_generations : int
+            Number of generations to evolve.
+
+        Returns
+        -------
+        dict with best_params, best_fitness, history
+        """
+        # Initialise population
+        self.population = [random_vector() for _ in range(self.pop_size)]
+        self.fitnesses  = self._evaluate_all()
+
+        for gen in range(n_generations):
+            # Track best
+            gen_best_idx = int(np.argmax(self.fitnesses))
+            if self.fitnesses[gen_best_idx] > self.best_fitness:
+                self.best_fitness    = self.fitnesses[gen_best_idx]
+                self.best_individual = list(self.population[gen_best_idx])
+
+            gen_stats = {
+                "generation":  gen,
+                "best":        self.best_fitness,
+                "mean":        float(np.mean(self.fitnesses)),
+                "worst":       float(np.min(self.fitnesses)),
+                "std":         float(np.std(self.fitnesses)),
+            }
+            self.history.append(gen_stats)
+
+            if self.callback:
+                self.callback(gen, self.best_fitness, gen_stats)
+
+            # Elitism: preserve top individuals
+            elite_indices = sorted(
+                range(self.pop_size), key=lambda i: self.fitnesses[i], reverse=True
+            )[:self.elitism]
+            new_population = [list(self.population[i]) for i in elite_indices]
+
+            # Fill rest via selection + crossover + mutation
+            while len(new_population) < self.pop_size:
+                p1 = self._tournament_select()
+                p2 = self._tournament_select()
+                child = self._uniform_crossover(p1, p2)
+                child = self._mutate(child)
+                new_population.append(child)
+
+            self.population = new_population
+            self.fitnesses  = self._evaluate_all()
+
+        # Final best
+        gen_best_idx = int(np.argmax(self.fitnesses))
+        if self.fitnesses[gen_best_idx] > self.best_fitness:
+            self.best_fitness    = self.fitnesses[gen_best_idx]
+            self.best_individual = list(self.population[gen_best_idx])
+
+        return {
+            "best_params":  vector_to_params(self.best_individual),
+            "best_fitness": self.best_fitness,
+            "history":      self.history,
+        }
+
+
+# ===========================================================================
+# 2. Particle Swarm Optimization
+# ===========================================================================
+
+class ParticleSwarmOptimization:
+    """
+    Particle Swarm Optimization for ecosystem parameter search.
+
+    Configuration
+    -------------
+    n_particles : 30
+    w           : 0.7   (inertia weight)
+    c1          : 1.5   (cognitive coefficient)
+    c2          : 1.5   (social coefficient)
+    v_max       : 20% of each parameter's range
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 20,
+        n_particles: int = 30,
+        w: float  = 0.7,
+        c1: float = 1.5,
+        c2: float = 1.5,
+        max_steps: int = 120,
+        callback: Optional[Callable] = None,
+    ):
+        self.grid_size   = grid_size
+        self.n_particles = n_particles
+        self.w  = w
+        self.c1 = c1
+        self.c2 = c2
+        self.max_steps = max_steps
+        self.callback  = callback
+
+        # Compute velocity bounds per dimension
+        self.v_max = np.array([
+            0.20 * (PARAM_BOUNDS[k][1] - PARAM_BOUNDS[k][0])
+            for k in PARAM_KEYS
+        ])
+        self.lo = np.array([PARAM_BOUNDS[k][0] for k in PARAM_KEYS])
+        self.hi = np.array([PARAM_BOUNDS[k][1] for k in PARAM_KEYS])
+
+        # State
+        self.positions: np.ndarray = None  # (n_particles, DIM)
+        self.velocities: np.ndarray = None
+        self.pbest_pos: np.ndarray = None  # personal bests
+        self.pbest_fit: np.ndarray = None
+        self.gbest_pos: np.ndarray = None  # global best
+        self.gbest_fit: float = -np.inf
+        self.history: List[Dict] = []
+
+    # ------------------------------------------------------------------
+
+    def _evaluate(self, pos: np.ndarray) -> float:
+        result = evaluate_params(list(pos), grid_size=self.grid_size, max_steps=self.max_steps)
+        return result["fitness"]
+
+    def _evaluate_all(self) -> np.ndarray:
+        return np.array([self._evaluate(self.positions[i]) for i in range(self.n_particles)])
+
+    # ------------------------------------------------------------------
+
+    def run(self, n_iterations: int = 40) -> Dict:
+        """
+        Execute PSO.
+
+        Parameters
+        ----------
+        n_iterations : int
+
+        Returns
+        -------
+        dict with best_params, best_fitness, history
+        """
+        # Initialise positions uniformly within bounds
+        self.positions  = self.lo + np.random.rand(self.n_particles, DIM) * (self.hi - self.lo)
+        self.velocities = (np.random.rand(self.n_particles, DIM) - 0.5) * 2 * self.v_max
+
+        fitnesses = self._evaluate_all()
+
+        self.pbest_pos = self.positions.copy()
+        self.pbest_fit = fitnesses.copy()
+
+        gbest_idx = int(np.argmax(fitnesses))
+        self.gbest_pos = self.positions[gbest_idx].copy()
+        self.gbest_fit = float(fitnesses[gbest_idx])
+
+        for it in range(n_iterations):
+            # Update velocity and position for each particle
+            r1 = np.random.rand(self.n_particles, DIM)
+            r2 = np.random.rand(self.n_particles, DIM)
+
+            # v = w*v + c1*r1*(pbest - x) + c2*r2*(gbest - x)
+            self.velocities = (
+                self.w * self.velocities
+                + self.c1 * r1 * (self.pbest_pos - self.positions)
+                + self.c2 * r2 * (self.gbest_pos - self.positions)
+            )
+            # Clamp velocities
+            self.velocities = np.clip(self.velocities, -self.v_max, self.v_max)
+
+            # Update positions and clamp to bounds
+            self.positions = self.positions + self.velocities
+            self.positions = np.clip(self.positions, self.lo, self.hi)
+
+            # Evaluate
+            fitnesses = self._evaluate_all()
+
+            # Update personal bests
+            for i in range(self.n_particles):
+                if fitnesses[i] > self.pbest_fit[i]:
+                    self.pbest_fit[i] = fitnesses[i]
+                    self.pbest_pos[i] = self.positions[i].copy()
+
+            # Update global best
+            gbest_idx = int(np.argmax(self.pbest_fit))
+            if self.pbest_fit[gbest_idx] > self.gbest_fit:
+                self.gbest_fit = float(self.pbest_fit[gbest_idx])
+                self.gbest_pos = self.pbest_pos[gbest_idx].copy()
+
+            stats = {
+                "iteration": it,
+                "best":  self.gbest_fit,
+                "mean":  float(np.mean(fitnesses)),
+                "worst": float(np.min(fitnesses)),
+                "std":   float(np.std(fitnesses)),
+            }
+            self.history.append(stats)
+
+            if self.callback:
+                self.callback(it, self.gbest_fit, stats)
+
+        return {
+            "best_params":  vector_to_params(self.gbest_pos.tolist()),
+            "best_fitness": self.gbest_fit,
+            "history":      self.history,
+        }
+
+
+# ===========================================================================
+# 3. Neural Network (from scratch, backprop)
+# ===========================================================================
+
+class NeuralNetwork:
+    """
+    Feedforward neural network trained via mini-batch gradient descent.
+
+    Architecture : 20 → 64 → 32 → 1
+    Activations  : ReLU (hidden layers), Linear (output)
+    Loss         : Mean Squared Error
+    Optimiser    : Mini-batch SGD with momentum
+
+    Predicts ecosystem survival time (months) given 20 parameter inputs.
+    Target: MAE < 10, R² > 0.8 on held-out test data.
+    """
+
+    def __init__(
+        self,
+        learning_rate: float = 0.001,
+        momentum: float = 0.9,
+        batch_size: int = 32,
+        l2_lambda: float = 1e-4,
+    ):
+        self.lr         = learning_rate
+        self.momentum   = momentum
+        self.batch_size = batch_size
+        self.l2_lambda  = l2_lambda
+
+        # Network architecture: layer sizes
+        self.layer_sizes = [len(PARAM_KEYS), 64, 32, 1]
+
+        # Weights and biases (He initialisation for ReLU)
+        self.weights: List[np.ndarray] = []
+        self.biases:  List[np.ndarray] = []
+        self._init_weights()
+
+        # Momentum buffers
+        self.vw = [np.zeros_like(w) for w in self.weights]
+        self.vb = [np.zeros_like(b) for b in self.biases]
+
+        # Normalisation stats (set during fit)
+        self.X_mean: Optional[np.ndarray] = None
+        self.X_std:  Optional[np.ndarray] = None
+        self.y_mean: float = 0.0
+        self.y_std:  float = 1.0
+
+        self.train_history: List[Dict] = []
+
+    # ------------------------------------------------------------------
+
+    def _init_weights(self):
+        """He (Kaiming) initialisation for ReLU networks."""
+        self.weights.clear()
+        self.biases.clear()
+        for i in range(len(self.layer_sizes) - 1):
+            fan_in = self.layer_sizes[i]
+            std = math.sqrt(2.0 / fan_in)
+            W = np.random.randn(fan_in, self.layer_sizes[i + 1]) * std
+            b = np.zeros((1, self.layer_sizes[i + 1]))
+            self.weights.append(W)
+            self.biases.append(b)
+
+    @staticmethod
+    def _relu(x: np.ndarray) -> np.ndarray:
+        return np.maximum(0.0, x)
+
+    @staticmethod
+    def _relu_grad(x: np.ndarray) -> np.ndarray:
+        return (x > 0).astype(float)
+
+    # ------------------------------------------------------------------
+
+    def _forward(self, X: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """
+        Forward pass.
+
+        Returns
+        -------
+        activations : list of layer outputs (including input)
+        pre_acts    : list of pre-activation values (z = Wx+b)
+        """
+        activations = [X]
+        pre_acts    = []
+        a = X
+        for i, (W, b) in enumerate(zip(self.weights, self.biases)):
+            z = a @ W + b
+            pre_acts.append(z)
+            # Last layer: linear; hidden: ReLU
+            a = z if (i == len(self.weights) - 1) else self._relu(z)
+            activations.append(a)
+        return activations, pre_acts
+
+    def _backward(
+        self,
+        activations: List[np.ndarray],
+        pre_acts: List[np.ndarray],
+        y: np.ndarray,
+    ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """
+        Backpropagation.
+
+        Returns
+        -------
+        dW : list of weight gradients
+        db : list of bias gradients
+        """
+        n = y.shape[0]
+        dW = [None] * len(self.weights)
+        db = [None] * len(self.biases)
+
+        # Output layer gradient (MSE loss, linear activation)
+        delta = (activations[-1] - y) * (2.0 / n)  # dL/dz for last layer
+
+        for i in reversed(range(len(self.weights))):
+            dW[i] = activations[i].T @ delta + self.l2_lambda * self.weights[i]
+            db[i] = np.sum(delta, axis=0, keepdims=True)
+            if i > 0:
+                # Backprop through ReLU
+                delta = (delta @ self.weights[i].T) * self._relu_grad(pre_acts[i - 1])
+
+        return dW, db
+
+    def _update_weights(self, dW: List[np.ndarray], db: List[np.ndarray]):
+        """Apply SGD with momentum."""
+        for i in range(len(self.weights)):
+            self.vw[i] = self.momentum * self.vw[i] - self.lr * dW[i]
+            self.vb[i] = self.momentum * self.vb[i] - self.lr * db[i]
+            self.weights[i] += self.vw[i]
+            self.biases[i]  += self.vb[i]
+
+    # ------------------------------------------------------------------
+
+    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 100):
+        """
+        Train the network on (X, y) data.
+
+        Parameters
+        ----------
+        X : (n_samples, 20) parameter matrix
+        y : (n_samples,)    survival months
+        epochs : int
+        """
+        # Normalise inputs
+        self.X_mean = X.mean(axis=0)
+        self.X_std  = X.std(axis=0) + 1e-8
+        self.y_mean = float(y.mean())
+        self.y_std  = float(y.std()) + 1e-8
+
+        X_norm = (X - self.X_mean) / self.X_std
+        y_norm = (y - self.y_mean) / self.y_std
+        y_col  = y_norm.reshape(-1, 1)
+
+        n = X_norm.shape[0]
+        for epoch in range(epochs):
+            # Shuffle
+            idx = np.random.permutation(n)
+            X_shuf = X_norm[idx]
+            y_shuf = y_col[idx]
+
+            epoch_loss = 0.0
+            for start in range(0, n, self.batch_size):
+                Xb = X_shuf[start:start + self.batch_size]
+                yb = y_shuf[start:start + self.batch_size]
+                acts, pres = self._forward(Xb)
+                dW, db = self._backward(acts, pres, yb)
+                self._update_weights(dW, db)
+                epoch_loss += float(np.mean((acts[-1] - yb) ** 2))
+
+            epoch_loss /= math.ceil(n / self.batch_size)
+
+            # Validation metrics on full set
+            y_pred = self.predict(X)
+            mae = float(np.mean(np.abs(y_pred - y)))
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            r2 = float(1.0 - ss_res / (ss_tot + 1e-8))
+
+            self.train_history.append({"epoch": epoch, "loss": epoch_loss, "mae": mae, "r2": r2})
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Predict survival months.
+
+        Parameters
+        ----------
+        X : (n_samples, 20)
+
+        Returns
+        -------
+        y_pred : (n_samples,) in original units
+        """
+        X_norm = (X - self.X_mean) / self.X_std
+        acts, _ = self._forward(X_norm)
+        y_norm = acts[-1].flatten()
+        return y_norm * self.y_std + self.y_mean
+
+    def save(self, path: str):
+        """Pickle the model to disk."""
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load(path: str) -> "NeuralNetwork":
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    # ------------------------------------------------------------------
+    # Feature importance via permutation
+    # ------------------------------------------------------------------
+
+    def feature_importance(self, X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+        """
+        Permutation feature importance: drop in performance when
+        each feature is randomly shuffled.
+        """
+        baseline_mae = float(np.mean(np.abs(self.predict(X) - y)))
+        importance = {}
+        for i, k in enumerate(PARAM_KEYS):
+            X_perm = X.copy()
+            np.random.shuffle(X_perm[:, i])
+            mae_perm = float(np.mean(np.abs(self.predict(X_perm) - y)))
+            importance[k] = max(0.0, mae_perm - baseline_mae)
+        return importance
+
+
+# ===========================================================================
+# 4. Decision Tree (Entropy / Information Gain)
+# ===========================================================================
+
+class DecisionTree:
+    """
+    Decision tree trained on (X, y_binary) data using entropy/information gain.
+
+    Max depth: 5.
+    Produces human-readable IF/THEN rules for interpretability.
+
+    Used to classify: does the ecosystem survive > 60 months? (1 = yes, 0 = no)
+    """
+
+    def __init__(self, max_depth: int = 5, min_samples_split: int = 10):
+        self.max_depth        = max_depth
+        self.min_samples_split = min_samples_split
+        self.root: Optional[Dict] = None
+        self.rules: List[str]     = []
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _entropy(y: np.ndarray) -> float:
+        """Compute binary entropy H(y)."""
+        n = len(y)
+        if n == 0:
+            return 0.0
+        p = float(np.sum(y)) / n
+        if p in (0.0, 1.0):
+            return 0.0
+        return -(p * math.log2(p) + (1 - p) * math.log2(1 - p))
+
+    def _information_gain(self, y: np.ndarray, mask: np.ndarray) -> float:
+        """Information gain of a binary split defined by boolean mask."""
+        n = len(y)
+        left  = y[mask]
+        right = y[~mask]
+        gain = (
+            self._entropy(y)
+            - len(left)  / n * self._entropy(left)
+            - len(right) / n * self._entropy(right)
+        )
+        return gain
+
+    def _best_split(self, X: np.ndarray, y: np.ndarray) -> Tuple[int, float, float]:
+        """Find best (feature_index, threshold) via exhaustive search."""
+        best_gain  = -np.inf
+        best_feat  = 0
+        best_thresh = 0.0
+
+        n_features = X.shape[1]
+        for feat in range(n_features):
+            # Try median-based thresholds for efficiency
+            values = np.unique(X[:, feat])
+            if len(values) <= 1:
+                continue
+            thresholds = (values[:-1] + values[1:]) / 2.0
+
+            for t in thresholds:
+                mask = X[:, feat] <= t
+                if mask.sum() < 2 or (~mask).sum() < 2:
+                    continue
+                gain = self._information_gain(y, mask)
+                if gain > best_gain:
+                    best_gain  = gain
+                    best_feat  = feat
+                    best_thresh = t
+
+        return best_feat, best_thresh, best_gain
+
+    def _build(self, X: np.ndarray, y: np.ndarray, depth: int) -> Dict:
+        """Recursively build the tree."""
+        n = len(y)
+        majority = int(np.round(np.mean(y))) if n > 0 else 0
+
+        # Stopping conditions
+        if (depth >= self.max_depth or
+                n < self.min_samples_split or
+                len(np.unique(y)) == 1):
+            return {"leaf": True, "class": majority, "n": n, "purity": float(np.mean(y == majority))}
+
+        feat, thresh, gain = self._best_split(X, y)
+
+        if gain <= 0:
+            return {"leaf": True, "class": majority, "n": n, "purity": float(np.mean(y == majority))}
+
+        mask  = X[:, feat] <= thresh
+        left  = self._build(X[mask],  y[mask],  depth + 1)
+        right = self._build(X[~mask], y[~mask], depth + 1)
+
+        return {
+            "leaf":   False,
+            "feat":   feat,
+            "thresh": thresh,
+            "gain":   gain,
+            "n":      n,
+            "left":   left,   # x[feat] <= thresh
+            "right":  right,  # x[feat] > thresh
+        }
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """
+        Train the decision tree.
+
+        Parameters
+        ----------
+        X : (n, 20) float array of ecosystem parameters
+        y : (n,)    binary labels (1 = ecosystem survived > 60 months)
+        """
+        self.root  = self._build(X, y.astype(int), depth=0)
+        self.rules = self._extract_rules(self.root, [], [])
+
+    def _predict_one(self, x: np.ndarray, node: Dict) -> int:
+        if node["leaf"]:
+            return node["class"]
+        if x[node["feat"]] <= node["thresh"]:
+            return self._predict_one(x, node["left"])
+        else:
+            return self._predict_one(x, node["right"])
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return np.array([self._predict_one(X[i], self.root) for i in range(len(X))])
+
+    def accuracy(self, X: np.ndarray, y: np.ndarray) -> float:
+        return float(np.mean(self.predict(X) == y.astype(int)))
+
+    # ------------------------------------------------------------------
+    # Rule extraction
+    # ------------------------------------------------------------------
+
+    def _extract_rules(self, node: Dict, conditions: List[str], rules: List[str]) -> List[str]:
+        """
+        DFS traversal to build human-readable IF/THEN rules.
+        Each leaf becomes one rule.
+        """
+        if node["leaf"]:
+            cond_str = " AND ".join(conditions) if conditions else "TRUE"
+            label    = "SURVIVES (>60 months)" if node["class"] == 1 else "COLLAPSES (≤60 months)"
+            purity   = node["purity"]
+            n        = node["n"]
+            rule = (
+                f"IF {cond_str}\n"
+                f"  THEN ecosystem {label}\n"
+                f"  [Confidence: {purity:.0%}, Samples: {n}]"
+            )
+            rules.append(rule)
+            return rules
+
+        k = PARAM_KEYS[node["feat"]]
+        t = node["thresh"]
+
+        # Left branch: x[feat] <= thresh
+        self._extract_rules(
+            node["left"],
+            conditions + [f"{k} ≤ {t:.3f}"],
+            rules,
+        )
+        # Right branch: x[feat] > thresh
+        self._extract_rules(
+            node["right"],
+            conditions + [f"{k} > {t:.3f}"],
+            rules,
+        )
+        return rules
+
+    def get_rules(self) -> List[str]:
+        return self.rules
+
+    def print_rules(self):
+        print("=" * 70)
+        print("DECISION TREE RULES")
+        print("=" * 70)
+        for i, rule in enumerate(self.rules, 1):
+            print(f"\nRule {i}:")
+            print(rule)
+
+    def feature_importance(self) -> Dict[str, float]:
+        """Sum information gain per feature across all internal nodes."""
+        importances = {k: 0.0 for k in PARAM_KEYS}
+
+        def _traverse(node):
+            if node["leaf"]:
+                return
+            k = PARAM_KEYS[node["feat"]]
+            importances[k] += node["gain"] * node["n"]
+            _traverse(node["left"])
+            _traverse(node["right"])
+
+        if self.root:
+            _traverse(self.root)
+
+        # Normalise
+        total = sum(importances.values())
+        if total > 0:
+            importances = {k: v / total for k, v in importances.items()}
+        return importances
+
+
+# ===========================================================================
+# Dataset generation helper
+# ===========================================================================
+
+def generate_training_data(
+    n_samples: int = 1000,
+    grid_size: int = 20,
+    max_steps: int = 120,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate (X, y) dataset by running n_samples random ecosystem simulations.
+
+    Parameters
+    ----------
+    n_samples : number of samples
+    grid_size : ecosystem grid size
+    max_steps : maximum simulation months
+
+    Returns
+    -------
+    X : (n_samples, 20) parameter array
+    y : (n_samples,)    survival months
+    """
+    X_list = []
+    y_list = []
+
+    for i in range(n_samples):
+        vec    = random_vector()
+        result = evaluate_params(vec, grid_size=grid_size, max_steps=max_steps)
+        X_list.append(vec)
+        y_list.append(result["survival_months"])
+
+        if verbose and (i + 1) % 100 == 0:
+            print(f"  Generated {i+1}/{n_samples} samples...")
+
+    X = np.array(X_list, dtype=np.float64)
+    y = np.array(y_list, dtype=np.float64)
+    return X, y
