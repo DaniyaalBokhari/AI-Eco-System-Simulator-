@@ -1,0 +1,546 @@
+"""
+ecosystem.py
+============
+Core grid-based ecosystem simulation engine.
+
+Simulates plants, herbivores, and carnivores on an N×N grid with:
+  - Energy-based organism lifecycle (birth, movement, feeding, death)
+  - Seasonal growth modulation (spring/summer/autumn/winter)
+  - Hemisphere-based seasonal phase offset
+  - 20+ tunable parameters via a flat parameter dictionary
+  - Shannon diversity index and population stability metrics
+  - Memory-safe design for 1000+ trial runs
+
+Author: AI Ecosystem Team
+"""
+
+import numpy as np
+import random
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Default parameter set (20+ tunable parameters)
+# ---------------------------------------------------------------------------
+DEFAULT_PARAMS: Dict[str, float] = {
+    # --- Initial populations ---
+    "init_plants":          50.0,   # starting plant count
+    "init_herbivores":      20.0,   # starting herbivore count
+    "init_carnivores":       8.0,   # starting carnivore count
+
+    # --- Plant dynamics ---
+    "plant_growth_rate":     0.35,  # probability a new plant spawns per step
+    "plant_energy":         10.0,   # energy a plant provides when eaten
+    "plant_max_density":     0.60,  # fraction of grid cells that can hold plants
+
+    # --- Herbivore dynamics ---
+    "herb_energy_init":     20.0,   # starting energy for each herbivore
+    "herb_energy_max":      40.0,   # maximum energy a herbivore can store
+    "herb_move_cost":        1.0,   # energy lost per movement step
+    "herb_eat_gain":        10.0,   # energy gained when eating a plant
+    "herb_repro_threshold": 25.0,   # energy needed to reproduce
+    "herb_repro_cost":       8.0,   # energy lost during reproduction
+    "herb_repro_prob":       0.30,  # probability of reproduction when threshold met
+    "herb_starve_rate":      1.5,   # passive energy loss per time step
+
+    # --- Carnivore dynamics ---
+    "carn_energy_init":     30.0,   # starting energy for each carnivore
+    "carn_energy_max":      60.0,   # maximum energy a carnivore can store
+    "carn_move_cost":        2.0,   # energy lost per movement step
+    "carn_eat_gain":        20.0,   # energy gained when eating a herbivore
+    "carn_repro_threshold": 45.0,   # energy needed to reproduce
+    "carn_repro_cost":      12.0,   # energy lost during reproduction
+    "carn_repro_prob":       0.20,  # probability of reproduction when threshold met
+    "carn_starve_rate":      2.0,   # passive energy loss per time step
+
+    # --- Environment ---
+    "season_amplitude":      0.40,  # how strongly seasons affect growth (0=none)
+    "hemisphere":            1.0,   # 1=northern, -1=southern (phase flip)
+    "carrying_capacity":     1.00,  # multiplier on plant_max_density
+}
+
+PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "init_plants":           (10, 200),
+    "init_herbivores":       ( 5, 100),
+    "init_carnivores":       ( 2,  40),
+    "plant_growth_rate":     (0.05, 0.80),
+    "plant_energy":          ( 5, 20),
+    "plant_max_density":     (0.20, 0.90),
+    "herb_energy_init":      (10, 50),
+    "herb_energy_max":       (20, 80),
+    "herb_move_cost":        (0.5, 3.0),
+    "herb_eat_gain":         ( 5, 25),
+    "herb_repro_threshold":  (15, 50),
+    "herb_repro_cost":       ( 4, 20),
+    "herb_repro_prob":       (0.05, 0.60),
+    "herb_starve_rate":      (0.5, 4.0),
+    "carn_energy_init":      (15, 60),
+    "carn_energy_max":       (30, 100),
+    "carn_move_cost":        (1.0, 5.0),
+    "carn_eat_gain":         (10, 40),
+    "carn_repro_threshold":  (25, 80),
+    "carn_repro_cost":       ( 6, 30),
+    "carn_repro_prob":       (0.05, 0.40),
+    "carn_starve_rate":      (0.5, 5.0),
+    "season_amplitude":      (0.0, 0.80),
+    "hemisphere":            (-1, 1),
+    "carrying_capacity":     (0.50, 1.50),
+}
+
+PARAM_KEYS = list(DEFAULT_PARAMS.keys())
+
+
+# ---------------------------------------------------------------------------
+# Organism dataclass
+# ---------------------------------------------------------------------------
+@dataclass
+class Organism:
+    """Represents a single organism on the grid."""
+    kind: str          # 'plant', 'herbivore', 'carnivore'
+    row: int
+    col: int
+    energy: float = 0.0
+    age: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Ecosystem class
+# ---------------------------------------------------------------------------
+class Ecosystem:
+    """
+    Grid-based ecosystem simulation.
+
+    Parameters
+    ----------
+    grid_size : int
+        Side length of the square grid (10, 20, 30, or 40).
+    params : dict, optional
+        Parameter overrides; merged with DEFAULT_PARAMS.
+    max_steps : int
+        Maximum simulation steps (each step ≈ one month).
+    seed : int, optional
+        RNG seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 20,
+        params: Optional[Dict[str, float]] = None,
+        max_steps: int = 120,
+        seed: Optional[int] = None,
+    ):
+        self.grid_size = grid_size
+        self.max_steps = max_steps
+        self.params = {**DEFAULT_PARAMS, **(params or {})}
+        self._clip_params()
+
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+
+        self.step_count = 0
+        self.plants: List[Organism] = []
+        self.herbivores: List[Organism] = []
+        self.carnivores: List[Organism] = []
+
+        # History for metrics
+        self.history: Dict[str, List] = {
+            "plants": [], "herbivores": [], "carnivores": [],
+            "diversity": [], "stability": [],
+        }
+
+        self._init_populations()
+
+    # ------------------------------------------------------------------
+    # Initialisation helpers
+    # ------------------------------------------------------------------
+
+    def _clip_params(self):
+        """Clip parameters to valid bounds."""
+        for k, (lo, hi) in PARAM_BOUNDS.items():
+            if k in self.params:
+                self.params[k] = max(lo, min(hi, self.params[k]))
+
+    def _random_cell(self) -> Tuple[int, int]:
+        return (
+            random.randint(0, self.grid_size - 1),
+            random.randint(0, self.grid_size - 1),
+        )
+
+    def _init_populations(self):
+        """Place organisms randomly on the grid."""
+        p = self.params
+        n_plants = int(p["init_plants"])
+        n_herb   = int(p["init_herbivores"])
+        n_carn   = int(p["init_carnivores"])
+
+        # Cap to grid capacity
+        grid_cells = self.grid_size ** 2
+        n_plants = min(n_plants, int(grid_cells * p["plant_max_density"]))
+        n_herb   = min(n_herb,   grid_cells // 2)
+        n_carn   = min(n_carn,   grid_cells // 4)
+
+        used_plant_cells = set()
+        for _ in range(n_plants):
+            r, c = self._random_cell()
+            while (r, c) in used_plant_cells:
+                r, c = self._random_cell()
+            used_plant_cells.add((r, c))
+            self.plants.append(Organism("plant", r, c))
+
+        for _ in range(n_herb):
+            r, c = self._random_cell()
+            self.herbivores.append(Organism("herbivore", r, c, energy=p["herb_energy_init"]))
+
+        for _ in range(n_carn):
+            r, c = self._random_cell()
+            self.carnivores.append(Organism("carnivore", r, c, energy=p["carn_energy_init"]))
+
+    # ------------------------------------------------------------------
+    # Seasonal growth modifier
+    # ------------------------------------------------------------------
+
+    def _season_factor(self) -> float:
+        """
+        Returns a multiplicative growth modifier in [1-A, 1+A] based on
+        a sinusoidal season cycle.  Northern hemisphere peaks in summer
+        (months 6-7); southern hemisphere is phase-flipped.
+        """
+        p = self.params
+        A = p["season_amplitude"]
+        phase = p["hemisphere"] * math.pi / 6.0  # 30° per month
+        factor = 1.0 + A * math.sin(self.step_count * phase)
+        return max(0.1, factor)
+
+    # ------------------------------------------------------------------
+    # Grid helpers
+    # ------------------------------------------------------------------
+
+    def _neighbors(self, r: int, c: int, radius: int = 1) -> List[Tuple[int, int]]:
+        """Return valid Moore-neighborhood cells."""
+        cells = []
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
+                    cells.append((nr, nc))
+        return cells
+
+    def _plant_positions(self) -> set:
+        return {(p.row, p.col) for p in self.plants}
+
+    def _herb_positions(self) -> Dict[Tuple[int, int], Organism]:
+        pos = {}
+        for h in self.herbivores:
+            pos[(h.row, h.col)] = h
+        return pos
+
+    # ------------------------------------------------------------------
+    # Update steps
+    # ------------------------------------------------------------------
+
+    def _update_plants(self, season: float):
+        """Grow new plants based on growth rate × season factor."""
+        p = self.params
+        max_plants = int(self.grid_size ** 2 * p["plant_max_density"] * p["carrying_capacity"])
+        if len(self.plants) >= max_plants:
+            return
+
+        # Each existing plant may produce a neighbour seedling
+        new_plants = []
+        plant_positions = self._plant_positions()
+        for plant in self.plants:
+            if random.random() < p["plant_growth_rate"] * season:
+                neighbors = self._neighbors(plant.row, plant.col)
+                random.shuffle(neighbors)
+                for nr, nc in neighbors:
+                    if (nr, nc) not in plant_positions:
+                        new_plants.append(Organism("plant", nr, nc))
+                        plant_positions.add((nr, nc))
+                        break
+
+        # Spontaneous growth to fill sparse areas
+        if len(self.plants) < max_plants // 2:
+            for _ in range(3):
+                if random.random() < p["plant_growth_rate"] * season * 0.5:
+                    r, c = self._random_cell()
+                    if (r, c) not in plant_positions:
+                        new_plants.append(Organism("plant", r, c))
+                        plant_positions.add((r, c))
+
+        self.plants.extend(new_plants)
+        # Cap
+        if len(self.plants) > max_plants:
+            self.plants = self.plants[:max_plants]
+
+    def _update_herbivores(self, plant_pos: set) -> set:
+        """
+        Move herbivores, eat plants, reproduce, and apply starvation.
+        Returns set of plant positions that were eaten.
+        """
+        p = self.params
+        eaten_plants: set = set()
+        new_herbivores: List[Organism] = []
+        survivors: List[Organism] = []
+
+        for h in self.herbivores:
+            h.age += 1
+            # Passive energy loss
+            h.energy -= p["herb_starve_rate"]
+
+            if h.energy <= 0:
+                continue  # herbivore dies
+
+            # Try to eat adjacent or current cell plant
+            possible_food = [(h.row, h.col)] + self._neighbors(h.row, h.col)
+            random.shuffle(possible_food)
+            ate = False
+            for r, c in possible_food:
+                if (r, c) in plant_pos and (r, c) not in eaten_plants:
+                    eaten_plants.add((r, c))
+                    h.energy = min(h.energy + p["herb_eat_gain"], p["herb_energy_max"])
+                    h.row, h.col = r, c
+                    ate = True
+                    break
+
+            if not ate:
+                # Move to random neighbor
+                h.energy -= p["herb_move_cost"]
+                if h.energy <= 0:
+                    continue
+                neighbors = self._neighbors(h.row, h.col)
+                if neighbors:
+                    nr, nc = random.choice(neighbors)
+                    h.row, h.col = nr, nc
+
+            # Reproduce
+            if h.energy >= p["herb_repro_threshold"] and random.random() < p["herb_repro_prob"]:
+                h.energy -= p["herb_repro_cost"]
+                nr, nc = random.choice(self._neighbors(h.row, h.col) or [(h.row, h.col)])
+                child = Organism("herbivore", nr, nc, energy=p["herb_energy_init"] * 0.6)
+                new_herbivores.append(child)
+
+            survivors.append(h)
+
+        self.herbivores = survivors + new_herbivores
+        return eaten_plants
+
+    def _update_carnivores(self, herb_map: Dict[Tuple[int, int], Organism]) -> set:
+        """
+        Move carnivores, eat herbivores, reproduce, apply starvation.
+        Returns set of eaten herbivore ids.
+        """
+        p = self.params
+        eaten_herb_ids: set = set()
+        new_carnivores: List[Organism] = []
+        survivors: List[Organism] = []
+
+        for c_org in self.carnivores:
+            c_org.age += 1
+            c_org.energy -= p["carn_starve_rate"]
+
+            if c_org.energy <= 0:
+                continue
+
+            # Hunt adjacent herbivores
+            possible_targets = [(c_org.row, c_org.col)] + self._neighbors(c_org.row, c_org.col)
+            random.shuffle(possible_targets)
+            hunted = False
+            for r, c in possible_targets:
+                if (r, c) in herb_map:
+                    target = herb_map[(r, c)]
+                    if id(target) not in eaten_herb_ids:
+                        eaten_herb_ids.add(id(target))
+                        c_org.energy = min(c_org.energy + p["carn_eat_gain"], p["carn_energy_max"])
+                        c_org.row, c_org.col = r, c
+                        hunted = True
+                        break
+
+            if not hunted:
+                c_org.energy -= p["carn_move_cost"]
+                if c_org.energy <= 0:
+                    continue
+                neighbors = self._neighbors(c_org.row, c_org.col)
+                if neighbors:
+                    nr, nc = random.choice(neighbors)
+                    c_org.row, c_org.col = nr, nc
+
+            # Reproduce
+            if c_org.energy >= p["carn_repro_threshold"] and random.random() < p["carn_repro_prob"]:
+                c_org.energy -= p["carn_repro_cost"]
+                nr, nc = random.choice(self._neighbors(c_org.row, c_org.col) or [(c_org.row, c_org.col)])
+                child = Organism("carnivore", nr, nc, energy=p["carn_energy_init"] * 0.6)
+                new_carnivores.append(child)
+
+            survivors.append(c_org)
+
+        # Remove eaten herbivores
+        self.carnivores = survivors + new_carnivores
+        self.herbivores = [h for h in self.herbivores if id(h) not in eaten_herb_ids]
+        return eaten_herb_ids
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def shannon_diversity(self) -> float:
+        """
+        Compute Shannon diversity index H = -Σ p_i ln(p_i).
+        Uses three species counts; returns 0 if only one species present.
+        """
+        counts = [len(self.plants), len(self.herbivores), len(self.carnivores)]
+        total = sum(counts)
+        if total == 0:
+            return 0.0
+        H = 0.0
+        for c in counts:
+            if c > 0:
+                p = c / total
+                H -= p * math.log(p)
+        # Normalise by ln(3) so max = 1.0
+        return H / math.log(3)
+
+    def stability_score(self) -> float:
+        """
+        Population stability: inverse of coefficient of variation across
+        the last 10 steps for each population.  Returns value in [0, 1].
+        """
+        window = 10
+        if len(self.history["herbivores"]) < window:
+            return 0.5
+        scores = []
+        for key in ["plants", "herbivores", "carnivores"]:
+            vals = self.history[key][-window:]
+            mean = np.mean(vals)
+            std  = np.std(vals)
+            if mean > 0:
+                cv = std / mean
+                scores.append(1.0 / (1.0 + cv))
+            else:
+                scores.append(0.0)
+        return float(np.mean(scores))
+
+    def fitness(self) -> float:
+        """
+        Composite fitness:
+          F = 0.5*(survival_months/120) + 0.3*Shannon + 0.2*Stability
+        """
+        survival = self.step_count / 120.0
+        diversity = self.shannon_diversity()
+        stability = self.stability_score()
+        return 0.5 * survival + 0.3 * diversity + 0.2 * stability
+
+    def is_alive(self) -> bool:
+        """Ecosystem is alive if all three species have at least 1 organism."""
+        return (len(self.plants) > 0 and
+                len(self.herbivores) > 0 and
+                len(self.carnivores) > 0)
+
+    # ------------------------------------------------------------------
+    # Main step
+    # ------------------------------------------------------------------
+
+    def step(self):
+        """Advance the simulation by one time step (month)."""
+        season = self._season_factor()
+
+        # Record history before update
+        self.history["plants"].append(len(self.plants))
+        self.history["herbivores"].append(len(self.herbivores))
+        self.history["carnivores"].append(len(self.carnivores))
+        self.history["diversity"].append(self.shannon_diversity())
+        self.history["stability"].append(self.stability_score())
+
+        # Remove eaten plants from last step's carnivore hunt not needed here
+        plant_pos = self._plant_positions()
+        herb_map  = self._herb_positions()
+
+        # Update in ecological order: plants → herbivores → carnivores
+        self._update_plants(season)
+        eaten_plants = self._update_herbivores(plant_pos)
+        # Remove eaten plants from list
+        self.plants = [p for p in self.plants if (p.row, p.col) not in eaten_plants]
+        self._update_carnivores(herb_map)
+
+        self.step_count += 1
+
+    # ------------------------------------------------------------------
+    # Full run
+    # ------------------------------------------------------------------
+
+    def run(self) -> Dict:
+        """
+        Run the simulation to completion (extinction or max_steps).
+
+        Returns
+        -------
+        dict with keys: survival_months, shannon_diversity, stability,
+                        fitness, history, final_counts
+        """
+        while self.step_count < self.max_steps and self.is_alive():
+            self.step()
+
+        return {
+            "survival_months": self.step_count,
+            "shannon_diversity": self.shannon_diversity(),
+            "stability": self.stability_score(),
+            "fitness": self.fitness(),
+            "history": self.history,
+            "final_counts": {
+                "plants": len(self.plants),
+                "herbivores": len(self.herbivores),
+                "carnivores": len(self.carnivores),
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Grid state snapshot for GUI rendering
+    # ------------------------------------------------------------------
+
+    def get_grid_state(self) -> np.ndarray:
+        """
+        Return an N×N array encoding organism presence:
+          0 = empty, 1 = plant, 2 = herbivore, 3 = carnivore
+        Carnivores overwrite herbivores overwrite plants.
+        """
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        for p in self.plants:
+            grid[p.row, p.col] = 1
+        for h in self.herbivores:
+            grid[h.row, h.col] = 2
+        for c in self.carnivores:
+            grid[c.row, c.col] = 3
+        return grid
+
+
+# ---------------------------------------------------------------------------
+# Convenience: run a single trial from a parameter vector
+# ---------------------------------------------------------------------------
+
+def evaluate_params(
+    param_vector: List[float],
+    grid_size: int = 20,
+    max_steps: int = 120,
+    seed: Optional[int] = None,
+) -> Dict:
+    """
+    Convert a flat parameter vector → dict → run ecosystem → return metrics.
+
+    Parameters
+    ----------
+    param_vector : list of float, length == len(PARAM_KEYS)
+    grid_size    : int
+    max_steps    : int
+    seed         : optional RNG seed
+
+    Returns
+    -------
+    dict with fitness, survival_months, shannon_diversity, stability
+    """
+    params = dict(zip(PARAM_KEYS, param_vector))
+    eco = Ecosystem(grid_size=grid_size, params=params, max_steps=max_steps, seed=seed)
+    return eco.run()
