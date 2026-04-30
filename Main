@@ -1,0 +1,208 @@
+"""
+main.py
+=======
+Entry point for the AI Ecosystem Simulation project.
+
+Usage
+-----
+  python main.py            # launch full GUI
+  python main.py --cli      # run all experiments in terminal (no GUI)
+  python main.py --quick    # quick experiment run + basic results
+  python main.py --test     # run smoke tests only
+
+Author: AI Ecosystem Team
+"""
+
+import sys
+import argparse
+import os
+
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# CLI mode: run experiments without GUI
+# ---------------------------------------------------------------------------
+
+def run_cli(quick: bool = False):
+    """Run all six experiments from the command line."""
+    from experiments import run_all_experiments
+
+    print("=" * 60)
+    print("AI Ecosystem Simulation — CLI Mode")
+    print(f"Mode: {'Quick' if quick else 'Full'}")
+    print("=" * 60)
+
+    def cb(msg):
+        print(msg)
+
+    results = run_all_experiments(
+        grid_size=20,
+        quick_mode=quick,
+        callback=cb,
+    )
+
+    summary = results.get("summary", {})
+    print("\n" + "=" * 60)
+    print("FINAL SUMMARY")
+    print("=" * 60)
+    for k, v in summary.items():
+        print(f"  {k:35s}: {v}")
+
+    print(f"\nAll results saved to: {RESULTS_DIR}/")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+
+def run_tests():
+    """Run quick smoke tests to verify all modules work."""
+    print("Running smoke tests…")
+    from ecosystem import Ecosystem, evaluate_params, DEFAULT_PARAMS, PARAM_KEYS
+    from algorithms import (
+        GeneticAlgorithm, ParticleSwarmOptimization,
+        NeuralNetwork, DecisionTree,
+        generate_training_data, random_vector,
+    )
+    import numpy as np
+
+    errors = []
+
+    # Test 1: Ecosystem basic run
+    try:
+        eco = Ecosystem(grid_size=10, max_steps=5)
+        result = eco.run()
+        assert "fitness" in result, "No fitness key"
+        assert result["survival_months"] >= 0
+        print("  ✓ Ecosystem engine")
+    except Exception as e:
+        errors.append(f"Ecosystem: {e}")
+        print(f"  ✗ Ecosystem: {e}")
+
+    # Test 2: evaluate_params
+    try:
+        vec = random_vector()
+        r = evaluate_params(vec, grid_size=10, max_steps=5)
+        assert 0.0 <= r["fitness"] <= 1.5
+        print("  ✓ evaluate_params")
+    except Exception as e:
+        errors.append(f"evaluate_params: {e}")
+        print(f"  ✗ evaluate_params: {e}")
+
+    # Test 3: GA (tiny)
+    try:
+        ga = GeneticAlgorithm(grid_size=10, pop_size=4, max_steps=5)
+        r  = ga.run(n_generations=2)
+        assert "best_fitness" in r
+        print("  ✓ Genetic Algorithm")
+    except Exception as e:
+        errors.append(f"GA: {e}")
+        print(f"  ✗ GA: {e}")
+
+    # Test 4: PSO (tiny)
+    try:
+        pso = ParticleSwarmOptimization(grid_size=10, n_particles=4, max_steps=5)
+        r   = pso.run(n_iterations=2)
+        assert "best_fitness" in r
+        print("  ✓ PSO")
+    except Exception as e:
+        errors.append(f"PSO: {e}")
+        print(f"  ✗ PSO: {e}")
+
+    # Test 5: Neural Network
+    try:
+        X = np.random.rand(50, 20)
+        y = np.random.rand(50) * 120
+        nn = NeuralNetwork()
+        nn.fit(X, y, epochs=3)
+        preds = nn.predict(X)
+        assert preds.shape == (50,)
+        print("  ✓ Neural Network")
+    except Exception as e:
+        errors.append(f"NN: {e}")
+        print(f"  ✗ NN: {e}")
+
+    # Test 6: Decision Tree
+    try:
+        X = np.random.rand(60, 20)
+        y = (np.random.rand(60) > 0.5).astype(int)
+        dt = DecisionTree(max_depth=3)
+        dt.fit(X, y)
+        preds = dt.predict(X)
+        acc   = dt.accuracy(X, y)
+        rules = dt.get_rules()
+        assert len(rules) > 0
+        assert 0.0 <= acc <= 1.0
+        print(f"  ✓ Decision Tree ({len(rules)} rules, acc={acc:.2%})")
+    except Exception as e:
+        errors.append(f"DT: {e}")
+        print(f"  ✗ DT: {e}")
+
+    # Test 7: Grid sizes
+    for gs in [10, 20, 30, 40]:
+        try:
+            eco = Ecosystem(grid_size=gs, max_steps=3)
+            eco.run()
+            grid = eco.get_grid_state()
+            assert grid.shape == (gs, gs)
+            print(f"  ✓ Grid {gs}×{gs}")
+        except Exception as e:
+            errors.append(f"Grid {gs}: {e}")
+            print(f"  ✗ Grid {gs}: {e}")
+
+    # Test 8: Shannon diversity
+    try:
+        eco = Ecosystem(grid_size=10, max_steps=0)
+        h = eco.shannon_diversity()
+        assert 0.0 <= h <= 1.0
+        print("  ✓ Shannon diversity index")
+    except Exception as e:
+        errors.append(f"Shannon: {e}")
+        print(f"  ✗ Shannon: {e}")
+
+    # Result
+    print("\n" + "=" * 40)
+    if errors:
+        print(f"FAILED: {len(errors)} error(s)")
+        for e in errors:
+            print(f"  - {e}")
+        return False
+    else:
+        print(f"ALL TESTS PASSED ({8 - len(errors)}/8)")
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="AI Ecosystem Simulation")
+    parser.add_argument("--cli",   action="store_true", help="Run experiments in terminal")
+    parser.add_argument("--quick", action="store_true", help="Quick mode (smaller budgets)")
+    parser.add_argument("--test",  action="store_true", help="Run smoke tests")
+    args = parser.parse_args()
+
+    if args.test:
+        ok = run_tests()
+        sys.exit(0 if ok else 1)
+
+    if args.cli or args.quick:
+        run_cli(quick=args.quick)
+        return
+
+    # Launch GUI
+    try:
+        from gui import main as gui_main
+        gui_main()
+    except Exception as e:
+        print(f"GUI failed to start: {e}")
+        print("Falling back to CLI mode…")
+        run_cli(quick=True)
+
+
+if __name__ == "__main__":
+    main()
