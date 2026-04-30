@@ -1,0 +1,1034 @@
+"""
+gui.py
+======
+Professional-grade Tkinter GUI for the AI Ecosystem Simulation.
+
+Features
+--------
+- Grid size selector (10×10, 20×20, 30×30, 40×40)
+- Algorithm selector (GA, PSO, NN, Decision Tree)
+- Real-time animated grid (colour-coded organisms)
+- Live population, fitness, diversity, and stability graphs
+- Parameter sliders (20+ ecosystem parameters)
+- Algorithm comparison mode (side-by-side convergence plots)
+- Experiment runner with real-time progress log
+- Export: PNG graphs, CSV data, experiment JSON reports
+- Interactive legend; organism highlight toggle; speed control
+
+Author: AI Ecosystem Team
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import time
+import queue
+import json
+import os
+import csv
+import math
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from typing import Dict, List, Optional
+
+from ecosystem import (
+    Ecosystem, DEFAULT_PARAMS, PARAM_BOUNDS, PARAM_KEYS, evaluate_params
+)
+from algorithms import (
+    GeneticAlgorithm, ParticleSwarmOptimization,
+    NeuralNetwork, DecisionTree,
+    generate_training_data, random_vector,
+)
+from experiments import run_all_experiments
+
+# ---------------------------------------------------------------------------
+# Colour palette
+# ---------------------------------------------------------------------------
+BG_DARK   = "#1a1a2e"
+BG_PANEL  = "#16213e"
+BG_CARD   = "#0f3460"
+ACCENT    = "#e94560"
+GREEN     = "#00b4d8"
+YELLOW    = "#ffd60a"
+FG_LIGHT  = "#e0e0e0"
+FG_DIM    = "#9e9e9e"
+
+GRID_COLORS = {
+    0: "#1a1a2e",   # empty
+    1: "#2d6a4f",   # plant  (green)
+    2: "#4361ee",   # herbivore (blue)
+    3: "#e94560",   # carnivore (red)
+}
+
+# ---------------------------------------------------------------------------
+# Utility: run function in background thread, report via queue
+# ---------------------------------------------------------------------------
+
+class WorkerThread(threading.Thread):
+    """Generic background worker with result queue."""
+
+    def __init__(self, fn, args=(), kwargs=None, q: queue.Queue = None):
+        super().__init__(daemon=True)
+        self.fn     = fn
+        self.args   = args
+        self.kwargs = kwargs or {}
+        self.q      = q or queue.Queue()
+
+    def run(self):
+        try:
+            result = self.fn(*self.args, **self.kwargs)
+            self.q.put(("done", result))
+        except Exception as e:
+            import traceback
+            self.q.put(("error", str(e) + "\n" + traceback.format_exc()))
+
+
+# ===========================================================================
+# Main Application Window
+# ===========================================================================
+
+class EcosystemApp(tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title("AI Ecosystem Simulation – Evolutionary & ML Optimisation")
+        self.configure(bg=BG_DARK)
+        self.geometry("1400x860")
+        self.minsize(1100, 700)
+
+        # State
+        self.grid_size     = tk.IntVar(value=20)
+        self.algorithm_var = tk.StringVar(value="GA")
+        self.sim_speed_var = tk.DoubleVar(value=0.08)   # seconds per step
+        self.show_plants   = tk.BooleanVar(value=True)
+        self.show_herbs    = tk.BooleanVar(value=True)
+        self.show_carns    = tk.BooleanVar(value=True)
+        self.param_vars: Dict[str, tk.DoubleVar] = {}
+
+        self._ecosystem: Optional[Ecosystem] = None
+        self._sim_running  = False
+        self._sim_thread:  Optional[threading.Thread] = None
+        self._algo_thread: Optional[WorkerThread]     = None
+        self._algo_queue:  queue.Queue = queue.Queue()
+        self._exp_queue:   queue.Queue = queue.Queue()
+
+        # History buffers for live graphs
+        self._pop_history  = {"plants": [], "herbivores": [], "carnivores": [], "steps": []}
+        self._fit_history  = []
+        self._div_history  = []
+        self._stab_history = []
+        self._algo_conv    = {"GA": [], "PSO": []}
+
+        self._build_ui()
+        self._after_poll_algo()
+        self._after_poll_exp()
+
+    # ======================================================================
+    # UI Construction
+    # ======================================================================
+
+    def _build_ui(self):
+        """Construct all UI panels."""
+        self._build_menubar()
+
+        # Top bar
+        top = tk.Frame(self, bg=BG_DARK, pady=4)
+        top.pack(fill="x", padx=8, pady=(6, 0))
+        self._build_topbar(top)
+
+        # Main area: left sidebar + centre notebook + right panel
+        main = tk.Frame(self, bg=BG_DARK)
+        main.pack(fill="both", expand=True, padx=8, pady=6)
+
+        # Left sidebar (parameters)
+        left = tk.Frame(main, bg=BG_PANEL, width=240, relief="flat",
+                        highlightthickness=1, highlightbackground=BG_CARD)
+        left.pack(side="left", fill="y", padx=(0, 6))
+        left.pack_propagate(False)
+        self._build_param_panel(left)
+
+        # Centre notebook
+        centre = tk.Frame(main, bg=BG_DARK)
+        centre.pack(side="left", fill="both", expand=True)
+        self._build_notebook(centre)
+
+        # Right panel (algorithm controls + metrics)
+        right = tk.Frame(main, bg=BG_PANEL, width=230, relief="flat",
+                         highlightthickness=1, highlightbackground=BG_CARD)
+        right.pack(side="right", fill="y", padx=(6, 0))
+        right.pack_propagate(False)
+        self._build_right_panel(right)
+
+        # Status bar
+        self._status_var = tk.StringVar(value="Ready.")
+        sb = tk.Label(self, textvariable=self._status_var, bg=BG_CARD,
+                      fg=FG_DIM, anchor="w", padx=10, pady=3, font=("Consolas", 9))
+        sb.pack(fill="x", padx=0, pady=0, side="bottom")
+
+    # ------------------------------------------------------------------
+    # Menu bar
+    # ------------------------------------------------------------------
+
+    def _build_menubar(self):
+        menu = tk.Menu(self, bg=BG_PANEL, fg=FG_LIGHT, tearoff=0,
+                       activebackground=ACCENT)
+        # File
+        fm = tk.Menu(menu, tearoff=0, bg=BG_PANEL, fg=FG_LIGHT)
+        fm.add_command(label="Export Graph (PNG)",    command=self._export_graph)
+        fm.add_command(label="Export Data (CSV)",     command=self._export_csv)
+        fm.add_command(label="Export Report (JSON)",  command=self._export_report)
+        fm.add_separator()
+        fm.add_command(label="Exit", command=self.destroy)
+        menu.add_cascade(label="File", menu=fm)
+        # View
+        vm = tk.Menu(menu, tearoff=0, bg=BG_PANEL, fg=FG_LIGHT)
+        vm.add_checkbutton(label="Show Plants",     variable=self.show_plants)
+        vm.add_checkbutton(label="Show Herbivores", variable=self.show_herbs)
+        vm.add_checkbutton(label="Show Carnivores", variable=self.show_carns)
+        menu.add_cascade(label="View", menu=vm)
+        # Help
+        hm = tk.Menu(menu, tearoff=0, bg=BG_PANEL, fg=FG_LIGHT)
+        hm.add_command(label="About", command=self._show_about)
+        menu.add_cascade(label="Help", menu=hm)
+        self.config(menu=menu)
+
+    # ------------------------------------------------------------------
+    # Top bar
+    # ------------------------------------------------------------------
+
+    def _build_topbar(self, parent):
+        def _lbl(text, **kw):
+            kw.setdefault("bg", BG_DARK)
+            kw.setdefault("fg", FG_LIGHT)
+            kw.setdefault("font", ("Segoe UI", 10))
+            return tk.Label(parent, text=text, **kw)
+
+        tk.Label(parent, text="🌿 AI Ecosystem Sim", bg=BG_DARK, fg=ACCENT,
+                 font=("Segoe UI", 14, "bold")).pack(side="left", padx=(0, 20))
+
+        _lbl("Grid:").pack(side="left")
+        for gs in [10, 20, 30, 40]:
+            tk.Radiobutton(parent, text=f"{gs}×{gs}", variable=self.grid_size,
+                           value=gs, bg=BG_DARK, fg=FG_LIGHT, selectcolor=BG_CARD,
+                           activebackground=BG_DARK, activeforeground=ACCENT,
+                           font=("Segoe UI", 9)).pack(side="left")
+
+        ttk.Separator(parent, orient="vertical").pack(side="left", fill="y", padx=10)
+
+        _lbl("Algorithm:").pack(side="left")
+        algo_cb = ttk.Combobox(parent, textvariable=self.algorithm_var,
+                               values=["GA", "PSO", "Neural Network", "Decision Tree"],
+                               state="readonly", width=14)
+        algo_cb.pack(side="left", padx=4)
+
+        ttk.Separator(parent, orient="vertical").pack(side="left", fill="y", padx=10)
+
+        self._btn_sim_start = self._tb_btn(parent, "▶ Simulate", self._start_sim, GREEN)
+        self._btn_sim_stop  = self._tb_btn(parent, "⏹ Stop",     self._stop_sim,  ACCENT)
+        self._btn_algo_run  = self._tb_btn(parent, "⚡ Optimise", self._run_algo,  YELLOW)
+        self._btn_exp_run   = self._tb_btn(parent, "🔬 Run All Experiments",
+                                           self._run_experiments, "#a0a0ff")
+        self._btn_compare   = self._tb_btn(parent, "📊 Compare GA vs PSO",
+                                           self._run_comparison, "#ff9f1c")
+
+        _lbl("Speed:").pack(side="left", padx=(12, 0))
+        tk.Scale(parent, from_=0.02, to=0.40, resolution=0.01,
+                 variable=self.sim_speed_var, orient="horizontal",
+                 length=80, bg=BG_DARK, fg=FG_LIGHT,
+                 troughcolor=BG_CARD, highlightthickness=0).pack(side="left")
+
+    def _tb_btn(self, parent, text, cmd, color):
+        b = tk.Button(parent, text=text, command=cmd, bg=BG_CARD, fg=color,
+                      activebackground=BG_PANEL, activeforeground=color,
+                      relief="flat", padx=8, pady=3,
+                      font=("Segoe UI", 9, "bold"), cursor="hand2",
+                      highlightthickness=1, highlightbackground=color)
+        b.pack(side="left", padx=3)
+        return b
+
+    # ------------------------------------------------------------------
+    # Parameter panel (left sidebar)
+    # ------------------------------------------------------------------
+
+    def _build_param_panel(self, parent):
+        tk.Label(parent, text="Parameters", bg=BG_PANEL, fg=ACCENT,
+                 font=("Segoe UI", 11, "bold")).pack(pady=(10, 2))
+
+        canvas = tk.Canvas(parent, bg=BG_PANEL, highlightthickness=0)
+        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        # Group parameters
+        groups = {
+            "🌱 Plants":      [k for k in PARAM_KEYS if "plant" in k or "init_plant" in k],
+            "🐇 Herbivores":  [k for k in PARAM_KEYS if "herb" in k or "init_herb" in k],
+            "🦁 Carnivores":  [k for k in PARAM_KEYS if "carn" in k or "init_carn" in k],
+            "🌍 Environment": [k for k in PARAM_KEYS if k in
+                               ("season_amplitude", "hemisphere", "carrying_capacity")],
+        }
+
+        for grp_name, keys in groups.items():
+            tk.Label(inner, text=grp_name, bg=BG_PANEL, fg=GREEN,
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
+            for k in keys:
+                self._add_slider(inner, k)
+
+        # Reset button
+        tk.Button(inner, text="Reset Defaults", command=self._reset_params,
+                  bg=BG_CARD, fg=FG_LIGHT, relief="flat", cursor="hand2",
+                  font=("Segoe UI", 9)).pack(pady=10, padx=8, fill="x")
+
+    def _add_slider(self, parent, key: str):
+        lo, hi = PARAM_BOUNDS[key]
+        var = tk.DoubleVar(value=DEFAULT_PARAMS[key])
+        self.param_vars[key] = var
+
+        frame = tk.Frame(parent, bg=BG_PANEL)
+        frame.pack(fill="x", padx=6, pady=1)
+
+        label_text = key.replace("_", " ").title()
+        tk.Label(frame, text=label_text, bg=BG_PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 8), anchor="w", width=18,
+                 wraplength=120).pack(side="left")
+
+        val_lbl = tk.Label(frame, textvariable=var, bg=BG_PANEL, fg=FG_LIGHT,
+                           font=("Consolas", 8), width=5, anchor="e")
+        val_lbl.pack(side="right")
+
+        # Format label nicely
+        def _fmt_trace(*_):
+            val_lbl.config(text=f"{var.get():.2f}")
+        var.trace_add("write", _fmt_trace)
+
+        sl = tk.Scale(parent, from_=lo, to=hi,
+                      resolution=(hi - lo) / 200,
+                      variable=var, orient="horizontal",
+                      length=200, bg=BG_PANEL, fg=FG_LIGHT,
+                      troughcolor=BG_CARD, highlightthickness=0,
+                      showvalue=False, sliderlength=10)
+        sl.pack(padx=6)
+
+    def _reset_params(self):
+        for k, var in self.param_vars.items():
+            var.set(DEFAULT_PARAMS[k])
+
+    def _get_params(self) -> Dict[str, float]:
+        return {k: var.get() for k, var in self.param_vars.items()}
+
+    # ------------------------------------------------------------------
+    # Centre notebook
+    # ------------------------------------------------------------------
+
+    def _build_notebook(self, parent):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TNotebook",         background=BG_DARK, borderwidth=0)
+        style.configure("TNotebook.Tab",     background=BG_PANEL, foreground=FG_DIM,
+                        padding=[10, 4], font=("Segoe UI", 9))
+        style.map("TNotebook.Tab",
+                  background=[("selected", BG_CARD)],
+                  foreground=[("selected", FG_LIGHT)])
+
+        self._nb = ttk.Notebook(parent)
+        self._nb.pack(fill="both", expand=True)
+
+        self._tab_grid   = tk.Frame(self._nb, bg=BG_DARK)
+        self._tab_graphs = tk.Frame(self._nb, bg=BG_DARK)
+        self._tab_algo   = tk.Frame(self._nb, bg=BG_DARK)
+        self._tab_exp    = tk.Frame(self._nb, bg=BG_DARK)
+
+        self._nb.add(self._tab_grid,   text="🌍 Live Grid")
+        self._nb.add(self._tab_graphs, text="📈 Populations")
+        self._nb.add(self._tab_algo,   text="⚡ Optimisation")
+        self._nb.add(self._tab_exp,    text="🔬 Experiments")
+
+        self._build_grid_tab()
+        self._build_graphs_tab()
+        self._build_algo_tab()
+        self._build_exp_tab()
+
+    # ------------------------------------------------------------------
+    # Grid tab
+    # ------------------------------------------------------------------
+
+    def _build_grid_tab(self):
+        parent = self._tab_grid
+
+        # Legend
+        leg = tk.Frame(parent, bg=BG_DARK)
+        leg.pack(side="bottom", pady=4)
+        for label, color in [("Empty", "#1a1a2e"), ("Plant 🌱", "#2d6a4f"),
+                              ("Herbivore 🐇", "#4361ee"), ("Carnivore 🦁", "#e94560")]:
+            tk.Label(leg, text="  ", bg=color, width=2).pack(side="left", padx=1)
+            tk.Label(leg, text=label, bg=BG_DARK, fg=FG_DIM,
+                     font=("Segoe UI", 9)).pack(side="left", padx=(0, 12))
+
+        # Canvas for pixel grid
+        self._grid_canvas = tk.Canvas(parent, bg="#1a1a2e",
+                                      highlightthickness=0)
+        self._grid_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+        self._grid_canvas.bind("<Configure>", self._on_grid_resize)
+
+        self._cell_size = 20
+        self._grid_image_refs = []   # keep refs to avoid GC
+
+    def _on_grid_resize(self, event):
+        gs = self.grid_size.get()
+        self._cell_size = max(2, min(
+            event.width  // gs,
+            event.height // gs,
+        ))
+
+    def _draw_grid(self, grid: np.ndarray):
+        """Draw the ecosystem grid on the canvas."""
+        c  = self._grid_canvas
+        cs = self._cell_size
+        c.delete("all")
+        gs = grid.shape[0]
+        for r in range(gs):
+            for col in range(gs):
+                val = int(grid[r, col])
+                # Respect visibility toggles
+                if val == 1 and not self.show_plants.get():
+                    val = 0
+                if val == 2 and not self.show_herbs.get():
+                    val = 0
+                if val == 3 and not self.show_carns.get():
+                    val = 0
+                color = GRID_COLORS.get(val, "#000000")
+                x0, y0 = col * cs, r * cs
+                c.create_rectangle(x0, y0, x0 + cs, y0 + cs,
+                                   fill=color, outline="", tags="cell")
+
+    # ------------------------------------------------------------------
+    # Population graphs tab
+    # ------------------------------------------------------------------
+
+    def _build_graphs_tab(self):
+        fig = Figure(figsize=(8, 5), facecolor=BG_DARK)
+        self._ax_pop  = fig.add_subplot(221, facecolor=BG_PANEL)
+        self._ax_div  = fig.add_subplot(222, facecolor=BG_PANEL)
+        self._ax_stab = fig.add_subplot(223, facecolor=BG_PANEL)
+        self._ax_fit  = fig.add_subplot(224, facecolor=BG_PANEL)
+        fig.tight_layout(pad=2.5)
+
+        for ax in (self._ax_pop, self._ax_div, self._ax_stab, self._ax_fit):
+            ax.tick_params(colors=FG_DIM, labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(BG_CARD)
+            ax.set_facecolor(BG_PANEL)
+
+        self._canvas_pop = FigureCanvasTkAgg(fig, master=self._tab_graphs)
+        self._canvas_pop.get_tk_widget().pack(fill="both", expand=True)
+        self._fig_pop = fig
+
+    def _update_graphs(self):
+        """Refresh all population graphs with current history."""
+        steps = self._pop_history["steps"]
+
+        for ax in (self._ax_pop, self._ax_div, self._ax_stab, self._ax_fit):
+            ax.clear()
+            ax.set_facecolor(BG_PANEL)
+            ax.tick_params(colors=FG_DIM, labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(BG_CARD)
+
+        if steps:
+            # Population
+            ax = self._ax_pop
+            ax.plot(steps, self._pop_history["plants"],
+                    color="#2d6a4f", label="Plants", linewidth=1.2)
+            ax.plot(steps, self._pop_history["herbivores"],
+                    color="#4361ee", label="Herbivores", linewidth=1.2)
+            ax.plot(steps, self._pop_history["carnivores"],
+                    color="#e94560", label="Carnivores", linewidth=1.2)
+            ax.set_title("Population Dynamics", color=FG_LIGHT, fontsize=9)
+            ax.set_xlabel("Month", color=FG_DIM, fontsize=7)
+            ax.legend(fontsize=7, facecolor=BG_PANEL, labelcolor=FG_LIGHT)
+
+            # Diversity
+            self._ax_div.plot(steps, self._div_history,
+                              color=GREEN, linewidth=1.2)
+            self._ax_div.set_title("Shannon Diversity", color=FG_LIGHT, fontsize=9)
+            self._ax_div.set_ylim(0, 1.05)
+            self._ax_div.set_xlabel("Month", color=FG_DIM, fontsize=7)
+            self._ax_div.axhline(0.8, color=YELLOW, linestyle="--", linewidth=0.8)
+
+            # Stability
+            self._ax_stab.plot(steps, self._stab_history,
+                               color=YELLOW, linewidth=1.2)
+            self._ax_stab.set_title("Population Stability", color=FG_LIGHT, fontsize=9)
+            self._ax_stab.set_ylim(0, 1.05)
+            self._ax_stab.set_xlabel("Month", color=FG_DIM, fontsize=7)
+
+            # Fitness
+            self._ax_fit.plot(steps, self._fit_history,
+                              color=ACCENT, linewidth=1.2)
+            self._ax_fit.set_title("Ecosystem Fitness", color=FG_LIGHT, fontsize=9)
+            self._ax_fit.set_ylim(0, 1.05)
+            self._ax_fit.set_xlabel("Month", color=FG_DIM, fontsize=7)
+
+        self._fig_pop.tight_layout(pad=2.5)
+        self._canvas_pop.draw()
+
+    # ------------------------------------------------------------------
+    # Optimisation tab
+    # ------------------------------------------------------------------
+
+    def _build_algo_tab(self):
+        parent = self._tab_algo
+
+        fig = Figure(figsize=(8, 5), facecolor=BG_DARK)
+        self._ax_conv  = fig.add_subplot(121, facecolor=BG_PANEL)
+        self._ax_comp  = fig.add_subplot(122, facecolor=BG_PANEL)
+        fig.tight_layout(pad=2.5)
+
+        for ax in (self._ax_conv, self._ax_comp):
+            ax.tick_params(colors=FG_DIM, labelsize=7)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(BG_CARD)
+
+        self._canvas_algo = FigureCanvasTkAgg(fig, master=parent)
+        self._canvas_algo.get_tk_widget().pack(fill="both", expand=True)
+        self._fig_algo = fig
+
+        # Metrics row below
+        met = tk.Frame(parent, bg=BG_PANEL)
+        met.pack(fill="x", padx=4, pady=4)
+        self._lbl_algo_best  = self._metric_label(met, "Best Fitness", "—")
+        self._lbl_algo_iter  = self._metric_label(met, "Iteration",    "—")
+        self._lbl_algo_time  = self._metric_label(met, "Elapsed",      "—")
+
+    def _metric_label(self, parent, title, val):
+        frame = tk.Frame(parent, bg=BG_CARD, padx=8, pady=4)
+        frame.pack(side="left", padx=4)
+        tk.Label(frame, text=title, bg=BG_CARD, fg=FG_DIM,
+                 font=("Segoe UI", 8)).pack()
+        lbl = tk.Label(frame, text=val, bg=BG_CARD, fg=FG_LIGHT,
+                       font=("Segoe UI", 11, "bold"))
+        lbl.pack()
+        return lbl
+
+    def _update_algo_graph(self):
+        for ax in (self._ax_conv, self._ax_comp):
+            ax.clear()
+            ax.set_facecolor(BG_PANEL)
+            ax.tick_params(colors=FG_DIM, labelsize=7)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(BG_CARD)
+
+        # Convergence
+        ax = self._ax_conv
+        if self._fit_history:
+            ax.plot(self._fit_history, color=ACCENT, linewidth=1.4, label="Fitness")
+        ax.set_title(f"Fitness Convergence – {self.algorithm_var.get()}",
+                     color=FG_LIGHT, fontsize=9)
+        ax.set_xlabel("Iteration", color=FG_DIM, fontsize=7)
+        ax.set_ylabel("Fitness", color=FG_DIM, fontsize=7)
+
+        # GA vs PSO comparison
+        ax2 = self._ax_comp
+        if self._algo_conv["GA"]:
+            ax2.plot(self._algo_conv["GA"],  color="#4361ee", label="GA",  linewidth=1.2)
+        if self._algo_conv["PSO"]:
+            ax2.plot(self._algo_conv["PSO"], color=YELLOW,    label="PSO", linewidth=1.2)
+        ax2.set_title("GA vs PSO Comparison", color=FG_LIGHT, fontsize=9)
+        ax2.set_xlabel("Iteration", color=FG_DIM, fontsize=7)
+        ax2.legend(fontsize=7, facecolor=BG_PANEL, labelcolor=FG_LIGHT)
+
+        self._fig_algo.tight_layout(pad=2.5)
+        self._canvas_algo.draw()
+
+    # ------------------------------------------------------------------
+    # Experiments tab
+    # ------------------------------------------------------------------
+
+    def _build_exp_tab(self):
+        parent = self._tab_exp
+
+        # Text log
+        self._exp_log = tk.Text(parent, bg=BG_PANEL, fg=FG_LIGHT,
+                                font=("Consolas", 9), wrap="word",
+                                state="disabled", relief="flat")
+        sb = ttk.Scrollbar(parent, orient="vertical", command=self._exp_log.yview)
+        self._exp_log.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._exp_log.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Results summary table (populated after experiments)
+        self._exp_table_frame = tk.Frame(parent, bg=BG_DARK)
+        self._exp_table_frame.pack(fill="x", padx=4, pady=(0, 4))
+
+    def _exp_log_append(self, msg: str):
+        self._exp_log.config(state="normal")
+        self._exp_log.insert("end", msg + "\n")
+        self._exp_log.see("end")
+        self._exp_log.config(state="disabled")
+
+    # ------------------------------------------------------------------
+    # Right panel (metrics + algo controls)
+    # ------------------------------------------------------------------
+
+    def _build_right_panel(self, parent):
+        tk.Label(parent, text="Live Metrics", bg=BG_PANEL, fg=ACCENT,
+                 font=("Segoe UI", 11, "bold")).pack(pady=(10, 4))
+
+        self._lbl_plants  = self._rp_metric(parent, "Plants",     "—")
+        self._lbl_herbs   = self._rp_metric(parent, "Herbivores", "—")
+        self._lbl_carns   = self._rp_metric(parent, "Carnivores", "—")
+        self._lbl_step    = self._rp_metric(parent, "Month",      "—")
+        self._lbl_fitness = self._rp_metric(parent, "Fitness",    "—")
+        self._lbl_div     = self._rp_metric(parent, "Diversity",  "—")
+        self._lbl_stab    = self._rp_metric(parent, "Stability",  "—")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=8)
+
+        tk.Label(parent, text="Algorithm Config", bg=BG_PANEL, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold")).pack()
+
+        # GA params
+        self._ga_gen_var   = tk.IntVar(value=20)
+        self._pso_iter_var = tk.IntVar(value=30)
+        self._nn_epoch_var = tk.IntVar(value=50)
+
+        self._rp_spinbox(parent, "GA Generations",  self._ga_gen_var,  5, 100)
+        self._rp_spinbox(parent, "PSO Iterations",  self._pso_iter_var, 5, 100)
+        self._rp_spinbox(parent, "NN Epochs",       self._nn_epoch_var, 10, 200)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=8)
+
+        # Organism visibility
+        tk.Label(parent, text="Visibility", bg=BG_PANEL, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold")).pack()
+        for text, var, color in [
+            ("🌱 Plants",     self.show_plants, "#2d6a4f"),
+            ("🐇 Herbivores", self.show_herbs,  "#4361ee"),
+            ("🦁 Carnivores", self.show_carns,  "#e94560"),
+        ]:
+            tk.Checkbutton(parent, text=text, variable=var,
+                           bg=BG_PANEL, fg=color, selectcolor=BG_CARD,
+                           activebackground=BG_PANEL, activeforeground=color,
+                           font=("Segoe UI", 9)).pack(anchor="w", padx=12)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=8)
+
+        # Best params display
+        tk.Label(parent, text="Best Params Found", bg=BG_PANEL, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold")).pack()
+        self._best_txt = tk.Text(parent, bg=BG_PANEL, fg=FG_DIM,
+                                 font=("Consolas", 7), wrap="word",
+                                 state="disabled", relief="flat", height=10)
+        self._best_txt.pack(fill="x", padx=6, pady=4)
+
+    def _rp_metric(self, parent, label, val):
+        fr = tk.Frame(parent, bg=BG_PANEL)
+        fr.pack(fill="x", padx=8, pady=1)
+        tk.Label(fr, text=label + ":", bg=BG_PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 9), width=12, anchor="w").pack(side="left")
+        lbl = tk.Label(fr, text=val, bg=BG_PANEL, fg=FG_LIGHT,
+                       font=("Segoe UI", 9, "bold"), anchor="e")
+        lbl.pack(side="right")
+        return lbl
+
+    def _rp_spinbox(self, parent, label, var, lo, hi):
+        fr = tk.Frame(parent, bg=BG_PANEL)
+        fr.pack(fill="x", padx=8, pady=2)
+        tk.Label(fr, text=label, bg=BG_PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 8), anchor="w").pack(anchor="w")
+        ttk.Spinbox(fr, from_=lo, to=hi, textvariable=var,
+                    width=6, font=("Consolas", 9)).pack(anchor="w")
+
+    def _update_right_panel(self):
+        """Update live metric labels from current ecosystem state."""
+        if self._ecosystem is None:
+            return
+        eco = self._ecosystem
+        self._lbl_plants.config( text=str(len(eco.plants)))
+        self._lbl_herbs.config(  text=str(len(eco.herbivores)))
+        self._lbl_carns.config(  text=str(len(eco.carnivores)))
+        self._lbl_step.config(   text=str(eco.step_count))
+        fit = eco.fitness()
+        div = eco.shannon_diversity()
+        stb = eco.stability_score()
+        self._lbl_fitness.config(text=f"{fit:.4f}")
+        self._lbl_div.config(    text=f"{div:.4f}")
+        self._lbl_stab.config(   text=f"{stb:.4f}")
+
+    # ======================================================================
+    # Simulation control
+    # ======================================================================
+
+    def _start_sim(self):
+        if self._sim_running:
+            return
+        gs     = self.grid_size.get()
+        params = self._get_params()
+        self._ecosystem = Ecosystem(grid_size=gs, params=params, max_steps=120)
+
+        # Reset history buffers
+        self._pop_history = {"plants": [], "herbivores": [], "carnivores": [], "steps": []}
+        self._fit_history  = []
+        self._div_history  = []
+        self._stab_history = []
+
+        self._sim_running = True
+        self._sim_thread  = threading.Thread(target=self._sim_loop, daemon=True)
+        self._sim_thread.start()
+        self._set_status("Simulation running…")
+
+    def _sim_loop(self):
+        """Background simulation loop, updates GUI via self.after."""
+        eco   = self._ecosystem
+        speed = self.sim_speed_var
+
+        while self._sim_running and eco.step_count < eco.max_steps and eco.is_alive():
+            eco.step()
+            step = eco.step_count
+
+            # Snapshot for GUI update
+            grid  = eco.get_grid_state()
+            np_c  = len(eco.plants)
+            nh_c  = len(eco.herbivores)
+            nc_c  = len(eco.carnivores)
+            fit   = eco.fitness()
+            div   = eco.shannon_diversity()
+            stab  = eco.stability_score()
+
+            self._pop_history["plants"].append(np_c)
+            self._pop_history["herbivores"].append(nh_c)
+            self._pop_history["carnivores"].append(nc_c)
+            self._pop_history["steps"].append(step)
+            self._fit_history.append(fit)
+            self._div_history.append(div)
+            self._stab_history.append(stab)
+
+            # Schedule GUI update on main thread
+            self.after(0, self._gui_sim_update, grid.copy(), fit, div, stab)
+
+            time.sleep(speed.get())
+
+        # Done
+        self._sim_running = False
+        reason = "Extinction" if not eco.is_alive() else "Max steps reached"
+        self.after(0, self._set_status,
+                   f"Simulation ended – {reason}. Survival: {eco.step_count} months")
+
+    def _gui_sim_update(self, grid, fit, div, stab):
+        """Called on main thread to refresh grid and graphs."""
+        self._draw_grid(grid)
+        self._update_right_panel()
+        # Throttle graph updates (every 3 steps)
+        if len(self._pop_history["steps"]) % 3 == 0:
+            self._update_graphs()
+
+    def _stop_sim(self):
+        self._sim_running = False
+        self._set_status("Simulation stopped.")
+
+    # ======================================================================
+    # Algorithm optimisation
+    # ======================================================================
+
+    def _run_algo(self):
+        if self._algo_thread and self._algo_thread.is_alive():
+            messagebox.showinfo("Busy", "An algorithm is already running.")
+            return
+
+        algo = self.algorithm_var.get()
+        gs   = self.grid_size.get()
+        self._fit_history = []
+        self._nb.select(self._tab_algo)
+        self._set_status(f"Running {algo}…")
+        self._algo_start_time = time.time()
+
+        if algo == "GA":
+            n_gen = self._ga_gen_var.get()
+
+            def _run():
+                def _cb(gen, best, stats):
+                    self._fit_history.append(best)
+                    self.after(0, self._algo_tick, gen, best)
+                ga = GeneticAlgorithm(grid_size=gs, pop_size=50, callback=_cb)
+                return ga.run(n_generations=n_gen)
+
+        elif algo == "PSO":
+            n_iter = self._pso_iter_var.get()
+
+            def _run():
+                def _cb(it, best, stats):
+                    self._fit_history.append(best)
+                    self.after(0, self._algo_tick, it, best)
+                pso = ParticleSwarmOptimization(grid_size=gs, n_particles=30, callback=_cb)
+                return pso.run(n_iterations=n_iter)
+
+        elif algo == "Neural Network":
+            n_ep = self._nn_epoch_var.get()
+
+            def _run():
+                X, y = generate_training_data(400, grid_size=gs, verbose=False)
+                nn = NeuralNetwork(learning_rate=0.002)
+                nn.fit(X, y, epochs=n_ep)
+                for h in nn.train_history:
+                    self._fit_history.append(1.0 - h["loss"])
+                    self.after(0, self._algo_tick, h["epoch"],
+                               round(1.0 - h["loss"], 4))
+                return {"best_fitness": float(max(self._fit_history)),
+                        "best_params": {}, "history": nn.train_history}
+
+        elif algo == "Decision Tree":
+            def _run():
+                X, y_raw = generate_training_data(300, grid_size=gs, verbose=False)
+                y = (y_raw > 60).astype(int)
+                dt = DecisionTree(max_depth=5)
+                dt.fit(X, y)
+                acc = dt.accuracy(X, y)
+                self._fit_history = [acc]
+                self.after(0, self._algo_tick, 0, acc)
+                return {"best_fitness": acc, "best_params": {},
+                        "rules": dt.get_rules(), "accuracy": acc}
+
+        self._algo_thread = WorkerThread(_run, q=self._algo_queue)
+        self._algo_thread.start()
+
+    def _algo_tick(self, iteration, best):
+        """Called from main thread during algorithm iterations."""
+        elapsed = time.time() - self._algo_start_time
+        self._lbl_algo_best.config(text=f"{best:.4f}")
+        self._lbl_algo_iter.config(text=str(iteration + 1))
+        self._lbl_algo_time.config(text=f"{elapsed:.1f}s")
+        self._update_algo_graph()
+
+    def _after_poll_algo(self):
+        """Poll algorithm result queue."""
+        try:
+            status, result = self._algo_queue.get_nowait()
+            if status == "done":
+                self._algo_done(result)
+            else:
+                messagebox.showerror("Algorithm Error", str(result))
+                self._set_status("Algorithm error.")
+        except queue.Empty:
+            pass
+        self.after(300, self._after_poll_algo)
+
+    def _algo_done(self, result):
+        bf = result.get("best_fitness", 0)
+        self._set_status(f"Optimisation complete. Best fitness: {bf:.4f}")
+
+        # Show best params
+        bp = result.get("best_params", {})
+        if bp:
+            txt = "\n".join(f"{k}: {v:.3f}" for k, v in list(bp.items())[:15])
+            self._best_txt.config(state="normal")
+            self._best_txt.delete("1.0", "end")
+            self._best_txt.insert("end", txt)
+            self._best_txt.config(state="disabled")
+
+            # Apply best params to sliders
+            for k, v in bp.items():
+                if k in self.param_vars:
+                    self.param_vars[k].set(round(v, 4))
+
+        # Show rules for DT
+        if "rules" in result:
+            self._exp_log_append("\n=== Decision Tree Rules ===")
+            for i, rule in enumerate(result["rules"][:8], 1):
+                self._exp_log_append(f"\nRule {i}:\n{rule}")
+
+    # ======================================================================
+    # GA vs PSO Comparison
+    # ======================================================================
+
+    def _run_comparison(self):
+        """Run both GA and PSO and overlay their convergence curves."""
+        if self._algo_thread and self._algo_thread.is_alive():
+            messagebox.showinfo("Busy", "Wait for current algorithm to finish.")
+            return
+
+        gs     = self.grid_size.get()
+        n_gen  = self._ga_gen_var.get()
+        n_iter = self._pso_iter_var.get()
+        self._algo_conv = {"GA": [], "PSO": []}
+        self._nb.select(self._tab_algo)
+        self._set_status("Running GA vs PSO comparison…")
+
+        def _run():
+            # GA
+            def _ga_cb(gen, best, stats):
+                self._algo_conv["GA"].append(best)
+                self.after(0, self._update_algo_graph)
+            ga = GeneticAlgorithm(grid_size=gs, pop_size=50, callback=_ga_cb)
+            ga.run(n_generations=n_gen)
+
+            # PSO
+            def _pso_cb(it, best, stats):
+                self._algo_conv["PSO"].append(best)
+                self.after(0, self._update_algo_graph)
+            pso = ParticleSwarmOptimization(grid_size=gs, n_particles=30, callback=_pso_cb)
+            pso.run(n_iterations=n_iter)
+
+            return {"GA_best": max(self._algo_conv["GA"]),
+                    "PSO_best": max(self._algo_conv["PSO"])}
+
+        self._algo_thread = WorkerThread(_run, q=self._algo_queue)
+        self._algo_thread.start()
+
+    # ======================================================================
+    # Experiments
+    # ======================================================================
+
+    def _run_experiments(self):
+        self._nb.select(self._tab_exp)
+        self._exp_log_append("=" * 55)
+        self._exp_log_append("Starting All Experiments (quick mode)…")
+        self._exp_log_append("=" * 55)
+
+        gs = self.grid_size.get()
+
+        def _run():
+            return run_all_experiments(
+                grid_size=gs,
+                quick_mode=True,
+                callback=lambda msg: self.after(0, self._exp_log_append, msg),
+            )
+
+        self._algo_thread = WorkerThread(_run, q=self._exp_queue)
+        self._algo_thread.start()
+
+    def _after_poll_exp(self):
+        try:
+            status, result = self._exp_queue.get_nowait()
+            if status == "done":
+                self._experiments_done(result)
+            else:
+                self._exp_log_append(f"ERROR: {result}")
+        except queue.Empty:
+            pass
+        self.after(400, self._after_poll_exp)
+
+    def _experiments_done(self, results):
+        self._exp_log_append("\n✓ Experiments complete!\n")
+        summary = results.get("summary", {})
+        if summary:
+            self._exp_log_append("=== SUMMARY ===")
+            for k, v in summary.items():
+                self._exp_log_append(f"  {k}: {v}")
+
+        self._set_status("All experiments done. Results saved to /results/")
+
+    # ======================================================================
+    # Export helpers
+    # ======================================================================
+
+    def _export_graph(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("All Files", "*.*")],
+            title="Save Graph",
+        )
+        if not path:
+            return
+        # Save the currently visible figure
+        tab = self._nb.index(self._nb.select())
+        if tab == 1:
+            self._fig_pop.savefig(path, dpi=150, facecolor=BG_DARK)
+        elif tab == 2:
+            self._fig_algo.savefig(path, dpi=150, facecolor=BG_DARK)
+        else:
+            messagebox.showinfo("Export", "Switch to Populations or Optimisation tab first.")
+            return
+        messagebox.showinfo("Saved", f"Graph saved to:\n{path}")
+
+    def _export_csv(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            title="Save Data",
+        )
+        if not path:
+            return
+        steps = self._pop_history["steps"]
+        if not steps:
+            messagebox.showinfo("No data", "Run a simulation first.")
+            return
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "plants", "herbivores", "carnivores",
+                             "fitness", "diversity", "stability"])
+            for i, s in enumerate(steps):
+                writer.writerow([
+                    s,
+                    self._pop_history["plants"][i],
+                    self._pop_history["herbivores"][i],
+                    self._pop_history["carnivores"][i],
+                    round(self._fit_history[i], 5) if i < len(self._fit_history) else "",
+                    round(self._div_history[i], 5)  if i < len(self._div_history) else "",
+                    round(self._stab_history[i], 5) if i < len(self._stab_history) else "",
+                ])
+        messagebox.showinfo("Saved", f"Data saved to:\n{path}")
+
+    def _export_report(self):
+        results_dir = os.path.join(os.path.dirname(__file__), "results")
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+            initialdir=results_dir,
+            title="Save Report",
+        )
+        if not path:
+            return
+        data = {
+            "simulation_history": self._pop_history,
+            "fitness_history": [round(v, 5) for v in self._fit_history],
+            "diversity_history": [round(v, 5) for v in self._div_history],
+            "stability_history": [round(v, 5) for v in self._stab_history],
+            "parameters": self._get_params(),
+            "grid_size": self.grid_size.get(),
+            "algorithm": self.algorithm_var.get(),
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        messagebox.showinfo("Saved", f"Report saved to:\n{path}")
+
+    # ======================================================================
+    # Utility
+    # ======================================================================
+
+    def _set_status(self, msg: str):
+        self._status_var.set(msg)
+
+    def _show_about(self):
+        messagebox.showinfo(
+            "About",
+            "AI Ecosystem Simulation v1.0\n\n"
+            "Algorithms: GA, PSO, Neural Network, Decision Tree\n"
+            "Built from scratch – no scikit-learn.\n\n"
+            "Team Project – AI Course\n"
+            "Grid sizes: 10×10, 20×20, 30×30, 40×40\n"
+            "Fitness = 0.5×Survival + 0.3×Diversity + 0.2×Stability"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    app = EcosystemApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
